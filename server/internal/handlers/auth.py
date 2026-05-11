@@ -10,43 +10,70 @@ from server.internal.app.dependencies import get_current_user
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
-@router.post("/register", response_model=UserOut, status_code=status.HTTP_201_CREATED)
+
+@router.post("/register", response_model=UserOut, status_code=status.HTTP_201_CREATED, summary="Регистрация нового пользователя")
 def register(user_in: UserCreate, db: Session = Depends(get_db)):
-    if db.query(User).filter(User.email == user_in.email).first():
-        raise HTTPException(status_code=400, detail="Email already registered")
+    """
+    Регистрирует нового пользователя в системе.
+    
+    Args:
+        user_in: Данные пользователя для регистрации (имя, email, пароль).
+        db: Сессия базы данных.
+        
+    Returns:
+        UserOut: Данные созданного пользователя (без пароля).
+        
+    Raises:
+        HTTPException 400: Если пользователь с таким email уже существует.
+    """
+    existing_user = db.query(User).filter(User.email == user_in.email).first()
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail="Email already registered"
+        )
+    
+    hashed_pwd = get_password_hash(user_in.password)
     
     db_user = User(
         first_name=user_in.first_name,
         last_name=user_in.last_name,
         patronymic=user_in.patronymic,
         email=user_in.email,
-        hashed_password=get_password_hash(user_in.password)
+        hashed_password=hashed_pwd,
+        is_active=True
     )
+    
     db.add(db_user)
     db.commit()
     db.refresh(db_user)
+    
     return db_user
 
 
-@router.post("/login", response_model=Token)
+@router.post("/login", response_model=Token, summary="Вход в систему (OAuth2)")
 def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db),
-    redirect_url: Optional[str] = Query(None),
-    state: Optional[str] = Query(None)
+    redirect_url: Optional[str] = Query(None, description="URL для редиректа после входа"),
+    state: Optional[str] = Query(None, description="OAuth2 state parameter")
 ):
     """
-    Вход в систему по email и паролю.
+    Аутентификация пользователя по email и паролю через OAuth2 flow.
     
-    Параметры формы:
-    - username: email пользователя (OAuth2 требует поле username, но мы используем его как email)
-    - password: пароль
+    Использует стандартную форму OAuth2PasswordRequestForm, где поле 'username' интерпретируется как email.
     
-    Query параметры (опционально):
-    - redirect_url: URL для редиректа после успешного логина
-    - state: состояние для OAuth2 flow
-    
-    Возвращает JWT токен доступа.
+    Args:
+        form_data: Форма с полями username (email) и password.
+        redirect_url: Опциональный URL для редиректа (для OAuth2 клиентов).
+        state: Опциональный параметр состояния OAuth2.
+        
+    Returns:
+        Token: JWT access token или объект с токеном и URL редиректа.
+        
+    Raises:
+        HTTPException 401: Если credentials неверны или аккаунт отключен.
+        HTTPException 400: Если redirect_url невалиден.
     """
     email = form_data.username
     password = form_data.password
@@ -65,7 +92,7 @@ def login(
     if redirect_url:
         if not redirect_url.startswith(('http://', 'https://')):
             raise HTTPException(
-                status_code=400,
+                status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid redirect_url: must start with http:// or https://"
             )
         
@@ -87,54 +114,83 @@ def login(
     return {"access_token": access_token, "token_type": "bearer"}
 
 
-@router.post("/logout")
+@router.post("/logout", summary="Выход из системы")
 def logout(current_user: User = Depends(get_current_user)):
     """
-    Выход из системы.
+    Выполняет выход из системы.
     
-    В stateless JWT logout реализуется на клиенте (удаление токена).
-    Сервер просто подтверждает успех.
+    Так как используется stateless JWT аутентификация, сервер не хранит сессию.
+    Клиент должен самостоятельно удалить токен из локального хранилища.
+    Этот эндпоинт служит для подтверждения действия и возможной очистки куки (если используются).
+    
+    Returns:
+        dict: Сообщение об успешном выходе.
     """
     return {"message": "Successfully logged out"}
 
 
-@router.get("/me", response_model=UserOut)
+@router.get("/me", response_model=UserOut, summary="Получить текущий профиль")
 def get_profile(current_user: User = Depends(get_current_user)):
     """
-    Получение данных текущего пользователя.
+    Возвращает данные профиля текущего авторизованного пользователя.
+    
+    Requires:
+        Bearer Token: Valid JWT access token.
+        
+    Returns:
+        UserOut: Данные пользователя (id, имя, email, статус активности).
     """
     return current_user
 
 
-@router.put("/me", response_model=UserOut)
+@router.put("/me", response_model=UserOut, summary="Обновить профиль")
 def update_profile(
     user_update: UserUpdate,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
-    Обновление данных профиля текущего пользователя.
+    Обновляет данные профиля текущего пользователя.
+    
+    Можно обновить имя, фамилию, отчество, email или пароль.
+    Пароль автоматически хэшируется перед сохранением.
+    
+    Args:
+        user_update: Объект с новыми данными (только измененные поля).
+        current_user: Текущий авторизованный пользователь.
+        db: Сессия базы данных.
+        
+    Returns:
+        UserOut: Обновленные данные пользователя.
     """
     for field, value in user_update.model_dump(exclude_unset=True).items():
         if field == "password":
             value = get_password_hash(value)
+
         setattr(current_user, field, value)
     
     db.commit()
     db.refresh(current_user)
+    
     return current_user
 
 
-@router.delete("/me", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/me", status_code=status.HTTP_204_NO_CONTENT, summary="Удалить аккаунт (мягкое удаление)")
 def soft_delete_account(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
-    Мягкое удаление аккаунта текущего пользователя.
+    Выполняет мягкое удаление аккаунта текущего пользователя.
     
-    Пользователь помечается как неактивный (is_active=False),
-    но данные остаются в базе. После этого пользователь не может войти в систему.
+    Аккаунт помечается как неактивный (is_active=False).
+    Данные сохраняются в базе для аудита или восстановления, но вход в систему становится невозможным.
+    
+    Raises:
+        HTTPException 401: Если пользователь не авторизован (обрабатывается зависимостью get_current_user).
+        
+    Returns:
+        No Content (204): Успешное выполнение операции без тела ответа.
     """
     current_user.is_active = False
     db.commit()
